@@ -8,6 +8,7 @@ remembered, so it never shows up again.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -15,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,7 +29,12 @@ HERE = Path(__file__).resolve().parent
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "wallswipe"
 CONFIG_FILE = STATE_DIR / "config.json"
 SEEN_FILE = STATE_DIR / "seen.json"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "wallswipe"
+CACHE_LIMIT = 1 << 30  # bytes; oldest files go first once the image cache grows past this
 UA = "wallswipe/1.0"
+# The browser loads images through /img so the server can retry and cache them; only
+# these hosts are proxied.
+IMAGE_HOSTS = ("wallhaven.cc", "unsplash.com", "pexels.com")
 
 # Aspect ratios offered in the UI, as width/height. Sources without a server-side
 # ratio filter get filtered here with RATIO_TOLERANCE.
@@ -252,18 +259,80 @@ def fused_search(f, page):
     return {"items": fused, "errors": errors, "exhausted": exhausted}
 
 
+EXTS = {"image/png": ".png", "image/webp": ".webp", "image/avif": ".avif", "image/jpeg": ".jpg"}
+url_locks = {}  # one in-flight fetch per URL; a second request waits and hits the cache
+
+
+def cache_path(url):
+    return CACHE_DIR / hashlib.sha1(url.encode()).hexdigest()
+
+
+def fetch_cached(url):
+    """Fetch an image into the cache (with retries) and return (path, content type)."""
+    host = urllib.parse.urlparse(url).hostname or ""
+    if not host.endswith(IMAGE_HOSTS):
+        raise ValueError(f"not an image host: {host}")
+    path = cache_path(url)
+    with lock:
+        ulock = url_locks.setdefault(url, threading.Lock())
+    with ulock:
+        if path.exists():
+            os.utime(path)
+            return path, path.with_suffix(".type").read_text()
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        last = None
+        for attempt in range(4):
+            if attempt:
+                time.sleep(wait)
+            wait = 2 ** attempt
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": UA})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    ctype = r.headers.get_content_type()
+                    tmp = path.with_suffix(".part")
+                    with open(tmp, "wb") as out:
+                        shutil.copyfileobj(r, out)
+                path.with_suffix(".type").write_text(ctype)
+                tmp.replace(path)
+                break
+            except urllib.error.HTTPError as e:
+                last = f"HTTP {e.code}"
+                if e.code == 429:
+                    wait = max(wait, int(e.headers.get("Retry-After") or 0))
+                elif e.code < 500:
+                    break  # 403/404 will not get better
+            except (urllib.error.URLError, OSError) as e:
+                last = str(getattr(e, "reason", e))
+            print(f"image fetch failed ({last}), attempt {attempt + 1}: {url}", flush=True)
+        else:
+            raise OSError(last)
+        if not path.exists():
+            raise OSError(last)
+    trim_cache()
+    return path, ctype
+
+
+def trim_cache():
+    files = sorted((p for p in CACHE_DIR.glob("*") if p.suffix == ""),
+                   key=lambda p: p.stat().st_mtime)
+    total = sum(p.stat().st_size for p in files)
+    for p in files:
+        if total <= CACHE_LIMIT:
+            break
+        total -= p.stat().st_size
+        p.unlink(missing_ok=True)
+        p.with_suffix(".type").unlink(missing_ok=True)
+
+
 def download(item):
+    """Save the full-resolution file; reuses the cached copy the card was shown from."""
     folder = Path(os.path.expanduser(config["folder"]))
     folder.mkdir(parents=True, exist_ok=True)
-    req = urllib.request.Request(item["full"], headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        ctype = r.headers.get_content_type()
-        ext = {"image/png": ".png", "image/webp": ".webp", "image/avif": ".avif"}.get(ctype, ".jpg")
-        dest = folder / f"{item['source']}-{item['id']}{ext}"
-        tmp = dest.with_suffix(dest.suffix + ".part")
-        with open(tmp, "wb") as out:
-            shutil.copyfileobj(r, out)
-        tmp.replace(dest)
+    cached, ctype = fetch_cached(item["full"])
+    dest = folder / f"{item['source']}-{item['id']}{EXTS.get(ctype, '.jpg')}"
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    shutil.copyfile(cached, tmp)
+    tmp.replace(dest)
     src = SOURCES.get(item["source"])
     if hasattr(src, "on_download"):
         threading.Thread(target=src.on_download, args=(item,), daemon=True).start()
@@ -274,13 +343,13 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
-    def send(self, code, body, ctype="application/json"):
+    def send(self, code, body, ctype="application/json", cache="no-store"):
         if not isinstance(body, bytes):
             body = json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
         self.end_headers()
         self.wfile.write(body)
 
@@ -292,6 +361,13 @@ class Handler(BaseHTTPRequestHandler):
         url = urllib.parse.urlparse(self.path)
         if url.path == "/":
             return self.send(200, (HERE / "index.html").read_bytes(), "text/html; charset=utf-8")
+        if url.path == "/img":
+            src = urllib.parse.parse_qs(url.query).get("u", [""])[0]
+            try:
+                path, ctype = fetch_cached(src)
+            except Exception as e:
+                return self.send(502, {"error": str(e)})
+            return self.send(200, path.read_bytes(), ctype, "private, max-age=86400")
         if url.path == "/api/config":
             with lock:
                 stats = {"yes": sum(v["verdict"] == "yes" for v in seen.values()),

@@ -51,9 +51,6 @@
     font-size: 34px; font-weight: 800; letter-spacing: 2px; opacity: 0; }
   .stamp.yes { left: 28px; color: var(--yes); transform: rotate(-14deg); }
   .stamp.no { right: 28px; color: var(--no); transform: rotate(14deg); }
-  .loading { position: absolute; top: 14px; right: 16px; font-size: 12px; color: var(--dim);
-    padding: 4px 10px; border-radius: 8px; background: #0009; }
-  .loading.failed { color: #fff; background: var(--no); font-size: 14px; font-weight: 600; cursor: pointer; }
 
   #empty { position: absolute; inset: 0; display: grid; place-items: center; text-align: center; color: var(--dim); }
   #empty[hidden] { display: none; }
@@ -134,7 +131,11 @@
 
 <script>
 const $ = (s) => document.querySelector(s);
-const state = { items: [], page: 0, exhausted: false, fetching: false, seed: "", history: [], stats: { yes: 0, no: 0 } };
+// Cards only enter the stack once their full image is downloaded and decoded. Candidates
+// wait in `queue`; up to LOAD_PARALLEL of them load at once until READY_TARGET are ready.
+const READY_TARGET = 10, LOAD_PARALLEL = 6;
+const imgUrl = (u) => "/img?u=" + encodeURIComponent(u);
+const state = { items: [], queue: [], loading: 0, failed: 0, page: 0, exhausted: false, fetching: false, seed: "", history: [], stats: { yes: 0, no: 0 } };
 const PREFS_KEY = "wallswipe.prefs";
 
 function toast(msg, err = false) {
@@ -160,7 +161,8 @@ async function api(path, body) {
 }
 
 function renderStats() {
-  $("#stats").innerHTML = `♥ ${state.stats.yes} &nbsp; ✕ ${state.stats.no} &nbsp; <kbd>←</kbd><kbd>→</kbd> <kbd>Z</kbd>`;
+  const buf = `${state.items.length} ready · ${state.loading} loading` + (state.failed ? ` · ${state.failed} failed` : "");
+  $("#stats").innerHTML = `♥ ${state.stats.yes} &nbsp; ✕ ${state.stats.no} &nbsp; ${buf} &nbsp; <kbd>←</kbd><kbd>→</kbd> <kbd>Z</kbd>`;
 }
 
 async function init() {
@@ -187,11 +189,11 @@ async function init() {
 
 function newSearch() {
   savePrefs();
-  state.items = []; state.page = 0; state.exhausted = false; state.history = [];
+  state.items = []; state.queue = []; state.loading = 0; state.failed = 0;
+  state.page = 0; state.exhausted = false; state.history = [];
   state.seed = Math.random().toString(36).slice(2, 8);
   state.gen = (state.gen || 0) + 1;
   render();
-  fill();
 }
 
 async function fill() {
@@ -200,7 +202,7 @@ async function fill() {
   state.fetching = true; render();
   try {
     // Pages can come back empty after the seen/size filters; keep paging a little.
-    for (let tries = 0; tries < 5 && state.items.length < 8 && !state.exhausted; tries++) {
+    for (let tries = 0; tries < 5 && state.queue.length < LOAD_PARALLEL * 2 && !state.exhausted; tries++) {
       const p = prefs();
       if (!p.sources.length) { state.exhausted = true; break; }
       const qs = new URLSearchParams({
@@ -210,16 +212,41 @@ async function fill() {
       const res = await api("/api/search?" + qs);
       if (gen !== state.gen) return;
       for (const [src, e] of Object.entries(res.errors)) toast(`${src}: ${e}`, true);
-      const have = new Set(state.items.map((i) => i.source + i.id));
-      state.items.push(...res.items.filter((i) => !have.has(i.source + i.id)));
+      const have = new Set([...state.items, ...state.queue, ...state.history].map((i) => i.source + i.id));
+      state.queue.push(...res.items.filter((i) => !have.has(i.source + i.id)));
       state.exhausted = res.exhausted;
-      render();
+      pump();
     }
   } catch (e) {
     toast(e.message, true);
   } finally {
     if (gen === state.gen) { state.fetching = false; render(); }
   }
+}
+
+function pump() {
+  while (state.loading < LOAD_PARALLEL && state.items.length + state.loading < READY_TARGET && state.queue.length) {
+    preload(state.queue.shift());
+  }
+  if (state.queue.length < LOAD_PARALLEL && !state.fetching && !state.exhausted) setTimeout(fill);
+  renderStats();
+}
+
+function preload(item) {
+  const gen = state.gen;
+  state.loading++;
+  const img = new Image();
+  img.src = imgUrl(item.preview);
+  img.decode()
+    .then(() => {
+      if (gen !== state.gen) return;
+      item._src = img.src;
+      item._img = img; // keeps the decoded bitmap alive
+      state.items.push(item);
+      render();
+    })
+    .catch(() => { if (gen === state.gen) state.failed++; })
+    .finally(() => { if (gen === state.gen) { state.loading--; pump(); } });
 }
 
 function cardFor(item) {
@@ -230,7 +257,6 @@ function cardFor(item) {
     <div class="blur"></div>
     <img alt="">
     <div class="stamp yes">YES</div><div class="stamp no">NOPE</div>
-    <div class="loading">loading full image…</div>
     <div class="meta">
       <span class="badge src"></span>
       <span class="badge">${item.width}×${item.height} · ${mp} MP</span>
@@ -241,29 +267,7 @@ function cardFor(item) {
   c.querySelector(".title").textContent = [item.author && "by " + item.author, item.title].filter(Boolean).join(" — ");
   c.querySelector("a").href = item.page;
   c.querySelector(".blur").style.backgroundImage = `url("${item.thumb}")`;
-  const img = c.querySelector("img");
-  img.src = item.thumb;
-  // Swap the small thumb for the big preview once it has loaded.
-  // Wallhaven's CDN occasionally refuses the full image (rate limit), so retry with backoff
-  // instead of leaving the blurry thumb up.
-  const label = c.querySelector(".loading");
-  let tries = 0;
-  const load = () => {
-    const big = new Image();
-    big.onload = () => { img.src = big.src; label.remove(); };
-    big.onerror = () => {
-      if (++tries < 4) {
-        label.textContent = `full image failed, retrying (${tries}/3)…`;
-        setTimeout(load, 1500 * tries);
-      } else {
-        label.textContent = "LOW-RES THUMBNAIL ONLY — click to retry (download is still full-res)";
-        label.classList.add("failed");
-        label.onclick = (e) => { e.stopPropagation(); tries = 0; label.classList.remove("failed"); label.textContent = "loading full image…"; load(); };
-      }
-    };
-    big.src = item.preview + (tries ? (item.preview.includes("?") ? "&" : "?") + "r=" + tries : "");
-  };
-  load();
+  c.querySelector("img").src = item._src;
   c._item = item;
   return c;
 }
@@ -277,9 +281,7 @@ function getCard(item) {
 
 function render() {
   const stack = $("#stack");
-  const [top, next, ...rest] = state.items;
-  // Keep DOM nodes alive for the next few so their big previews preload.
-  for (const it of rest.slice(0, 2)) getCard(it);
+  const [top, next] = state.items;
   const want = [next, top].filter(Boolean).map(getCard);
   for (const el of [...stack.children]) if (!want.includes(el)) el.remove();
   want.forEach((el, i) => {
@@ -290,8 +292,10 @@ function render() {
   });
   if (top) attachDrag(getCard(top));
   $("#empty").hidden = !!top;
-  $("#empty").querySelector("h2").textContent = state.fetching ? "Loading…" : "Nothing left";
-  if (state.items.length < 6) setTimeout(fill);
+  const busy = state.fetching || state.loading || state.queue.length;
+  $("#empty").querySelector("h2").textContent = busy ? `Loading full-res images… (${state.loading} in flight)` : "Nothing left";
+  $("#empty").querySelector("p").hidden = !!busy;
+  pump();
 }
 
 function attachDrag(card) {
@@ -299,7 +303,7 @@ function attachDrag(card) {
   card._drag = true;
   let x0 = 0, y0 = 0, dx = 0, dy = 0, down = false;
   card.addEventListener("pointerdown", (e) => {
-    if (e.target.closest("a, .loading") || card !== topCard()) return;
+    if (e.target.closest("a") || card !== topCard()) return;
     down = true; x0 = e.clientX; y0 = e.clientY; dx = dy = 0;
     card.setPointerCapture(e.pointerId); card.classList.add("dragging"); card.classList.remove("snap");
   });
@@ -337,6 +341,8 @@ function decide(verdict) {
   card.style.opacity = 0;
   state.items.shift();
   state.history.push(item);
+  // Undo only needs the URL (the browser cache still has it), not the decoded bitmap.
+  if (state.history.length > 20) delete state.history[state.history.length - 21]._img;
   state.stats[verdict]++; renderStats();
   setTimeout(() => {
     card.classList.remove("fly"); card.remove();
@@ -345,7 +351,7 @@ function decide(verdict) {
   render();
 
   if (verdict === "yes") toast("Downloading…");
-  api("/api/swipe", { item, verdict })
+  api("/api/swipe", { item: { ...item, _img: undefined }, verdict })
     .then((r) => verdict === "yes" && toast("Saved " + r.file.split("/").pop()))
     .catch((e) => { toast(e.message, true); state.stats[verdict]--; renderStats(); });
 }
@@ -354,7 +360,7 @@ async function undo() {
   const item = state.history.pop();
   if (!item) return toast("Nothing to undo");
   try {
-    await api("/api/undo", item);
+    await api("/api/undo", { source: item.source, id: item.id });
     state.items.unshift(item);
     const cfg = await api("/api/config"); state.stats = cfg.stats; renderStats();
     render();

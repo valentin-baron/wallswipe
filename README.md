@@ -50,5 +50,8 @@ minimum resolution, sources, Wallhaven categories. They persist between runs.
 
 - Downloads: `~/Pictures/Wallpapers` by default — click the folder button to change it.
   Named `<source>-<id>.<ext>`.
+- Image cache: `~/.cache/wallswipe/` (capped at 1 GB, oldest first). Cards only appear
+  once their full-resolution image is downloaded and decoded; the next 10 are kept ready
+  in the background, and a right-swipe copies the cached file instead of downloading again.
 - State: `~/.local/state/wallswipe/` (`config.json`, `seen.json`). Delete `seen.json`
   to see skipped wallpapers again.
