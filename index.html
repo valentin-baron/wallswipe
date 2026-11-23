@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wallswipe</title>
+<style>
+  :root {
+    --bg: #0f0f12; --panel: #1a1a20; --line: #2c2c35; --text: #e9e9ef; --dim: #9a9aa8;
+    --yes: #3ddc84; --no: #ff5c6c; --accent: #8b7cff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, sans-serif; overflow: hidden; }
+  button, input, select { font: inherit; color: inherit; }
+
+  header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 14px;
+    background: var(--panel); border-bottom: 1px solid var(--line); }
+  header form { display: contents; }
+  #q { flex: 1 1 220px; min-width: 160px; padding: 8px 12px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--bg); }
+  select { padding: 7px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); }
+  .chips { display: flex; gap: 4px; }
+  .chip { padding: 6px 10px; border-radius: 999px; border: 1px solid var(--line);
+    background: transparent; cursor: pointer; user-select: none; }
+  .chip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .chip:disabled { opacity: .35; cursor: not-allowed; }
+  .go { padding: 7px 14px; border-radius: 8px; border: 0; background: var(--accent); color: #fff; cursor: pointer; }
+  .sep { width: 1px; align-self: stretch; background: var(--line); }
+
+  main { position: relative; height: calc(100% - 58px - 84px); }
+  #stack { position: absolute; inset: 18px; }
+  .card { position: absolute; inset: 0; border-radius: 18px; overflow: hidden; background: #000;
+    box-shadow: 0 10px 40px #0008; touch-action: none; cursor: grab; will-change: transform; }
+  .card.behind { transform: scale(.96) translateY(10px); filter: brightness(.6); }
+  .card.dragging { cursor: grabbing; transition: none; }
+  .card.fly { transition: transform .35s ease-in, opacity .35s ease-in; }
+  .card.snap { transition: transform .2s ease-out; }
+  .card .blur { position: absolute; inset: -40px; background-size: cover; background-position: center;
+    filter: blur(30px) brightness(.45); }
+  .card img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain;
+    pointer-events: none; user-select: none; }
+  .card .meta { position: absolute; left: 0; right: 0; bottom: 0; padding: 40px 18px 14px;
+    background: linear-gradient(transparent, #000c); display: flex; gap: 10px; align-items: end; }
+  .badge { padding: 3px 9px; border-radius: 6px; background: #fff2; backdrop-filter: blur(6px);
+    font-size: 12px; white-space: nowrap; }
+  .badge.src { background: var(--accent); }
+  .meta .title { flex: 1; color: var(--dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meta a { color: var(--text); font-size: 12px; }
+  .stamp { position: absolute; top: 28px; padding: 6px 16px; border: 4px solid; border-radius: 10px;
+    font-size: 34px; font-weight: 800; letter-spacing: 2px; opacity: 0; }
+  .stamp.yes { left: 28px; color: var(--yes); transform: rotate(-14deg); }
+  .stamp.no { right: 28px; color: var(--no); transform: rotate(14deg); }
+  .loading { position: absolute; top: 14px; right: 16px; font-size: 12px; color: var(--dim); }
+
+  #empty { position: absolute; inset: 0; display: grid; place-items: center; text-align: center; color: var(--dim); }
+  #empty[hidden] { display: none; }
+
+  footer { height: 84px; display: flex; justify-content: center; align-items: center; gap: 22px; }
+  .round { width: 58px; height: 58px; border-radius: 50%; border: 2px solid var(--line);
+    background: var(--panel); font-size: 24px; cursor: pointer; display: grid; place-items: center; }
+  .round.small { width: 42px; height: 42px; font-size: 17px; }
+  .round.no { color: var(--no); border-color: var(--no); }
+  .round.yes { color: var(--yes); border-color: var(--yes); }
+  .round:hover { filter: brightness(1.3); }
+  #stats { position: absolute; left: 16px; bottom: 30px; color: var(--dim); font-size: 12px; }
+  #folderbtn { position: absolute; right: 16px; bottom: 26px; background: none; border: 1px solid var(--line);
+    border-radius: 8px; padding: 5px 10px; color: var(--dim); cursor: pointer; max-width: 30vw;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  #toast { position: fixed; left: 50%; top: 70px; transform: translateX(-50%); padding: 8px 16px;
+    border-radius: 10px; background: var(--panel); border: 1px solid var(--line); opacity: 0;
+    transition: opacity .2s; pointer-events: none; z-index: 10; }
+  #toast.show { opacity: 1; }
+  #toast.err { border-color: var(--no); color: var(--no); }
+  kbd { padding: 1px 5px; border: 1px solid var(--line); border-radius: 4px; font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <form id="search">
+    <input id="q" placeholder="Search wallpapers…  ( / )" autocomplete="off">
+    <select id="sort" title="Sort">
+      <option value="relevance">Relevance</option>
+      <option value="top">Top</option>
+      <option value="latest">Latest</option>
+      <option value="random">Random</option>
+    </select>
+    <select id="ratio" title="Aspect ratio">
+      <option value="any">Any ratio</option>
+      <option value="landscape">Landscape</option>
+      <option value="16x9">16:9</option>
+      <option value="16x10">16:10</option>
+      <option value="21x9">21:9</option>
+      <option value="32x9">32:9</option>
+      <option value="portrait">Portrait</option>
+    </select>
+    <select id="minres" title="Minimum resolution">
+      <option value="">Any size</option>
+      <option value="1920x1080">≥ 1080p</option>
+      <option value="2560x1440">≥ 1440p</option>
+      <option value="3840x2160">≥ 4K</option>
+      <option value="5120x1440">≥ 5120×1440</option>
+    </select>
+    <span class="sep"></span>
+    <span class="chips" id="sources"></span>
+    <span class="sep"></span>
+    <span class="chips" id="cats" title="Wallhaven categories">
+      <button type="button" class="chip on" data-cat="0">General</button>
+      <button type="button" class="chip on" data-cat="1">Anime</button>
+      <button type="button" class="chip on" data-cat="2">People</button>
+    </span>
+    <button class="go">Search</button>
+  </form>
+</header>
+
+<main>
+  <div id="stack"></div>
+  <div id="empty" hidden><div><h2>Nothing left</h2><p>Try another search or loosen the filters.</p></div></div>
+</main>
+
+<footer>
+  <span id="stats"></span>
+  <button class="round small" id="undo" title="Undo (Z)">↶</button>
+  <button class="round no" id="nobtn" title="Skip (← / H)">✕</button>
+  <button class="round yes" id="yesbtn" title="Download (→ / L)">♥</button>
+  <button class="round small" id="openbtn" title="Open source page (O)">↗</button>
+  <button id="folderbtn" title="Change download folder"></button>
+</footer>
+
+<div id="toast"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const state = { items: [], page: 0, exhausted: false, fetching: false, seed: "", history: [], stats: { yes: 0, no: 0 } };
+const PREFS_KEY = "wallswipe.prefs";
+
+function toast(msg, err = false) {
+  const t = $("#toast");
+  t.textContent = msg; t.className = "show" + (err ? " err" : "");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => (t.className = ""), err ? 4000 : 1600);
+}
+
+function prefs() {
+  const sources = [...document.querySelectorAll("#sources .chip.on")].map((c) => c.dataset.src);
+  const cats = [...document.querySelectorAll("#cats .chip")].map((c) => (c.classList.contains("on") ? 1 : 0)).join("");
+  return { q: $("#q").value, sort: $("#sort").value, ratio: $("#ratio").value, minres: $("#minres").value, sources, cats };
+}
+function savePrefs() { try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs())); } catch {} }
+function loadPrefs() { try { return JSON.parse(localStorage.getItem(PREFS_KEY)) || {}; } catch { return {}; } }
+
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+function renderStats() {
+  $("#stats").innerHTML = `♥ ${state.stats.yes} &nbsp; ✕ ${state.stats.no} &nbsp; <kbd>←</kbd><kbd>→</kbd> <kbd>Z</kbd>`;
+}
+
+async function init() {
+  const cfg = await api("/api/config");
+  state.stats = cfg.stats; renderStats();
+  $("#folderbtn").textContent = "📁 " + cfg.folder;
+  const p = loadPrefs();
+  const wanted = p.sources || cfg.sources.filter((s) => s.available).map((s) => s.name);
+  for (const s of cfg.sources) {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "chip"; b.dataset.src = s.name; b.textContent = s.label;
+    if (!s.available) { b.disabled = true; b.title = `No API key — set ${s.name.toUpperCase()} key (see README)`; }
+    else if (wanted.includes(s.name)) b.classList.add("on");
+    b.onclick = () => { b.classList.toggle("on"); newSearch(); };
+    $("#sources").append(b);
+  }
+  if (p.q) $("#q").value = p.q;
+  if (p.sort) $("#sort").value = p.sort;
+  if (p.ratio) $("#ratio").value = p.ratio;
+  $("#minres").value = p.minres ?? "2560x1440";
+  if (p.cats) [...document.querySelectorAll("#cats .chip")].forEach((c, i) => c.classList.toggle("on", p.cats[i] === "1"));
+  newSearch();
+}
+
+function newSearch() {
+  savePrefs();
+  state.items = []; state.page = 0; state.exhausted = false; state.history = [];
+  state.seed = Math.random().toString(36).slice(2, 8);
+  state.gen = (state.gen || 0) + 1;
+  render();
+  fill();
+}
+
+async function fill() {
+  if (state.fetching || state.exhausted) return;
+  const gen = state.gen;
+  state.fetching = true; render();
+  try {
+    // Pages can come back empty after the seen/size filters; keep paging a little.
+    for (let tries = 0; tries < 5 && state.items.length < 8 && !state.exhausted; tries++) {
+      const p = prefs();
+      if (!p.sources.length) { state.exhausted = true; break; }
+      const qs = new URLSearchParams({
+        q: p.q, sort: p.sort, ratio: p.ratio, minres: p.minres, sources: p.sources.join(","),
+        categories: p.cats || "111", seed: state.seed, page: ++state.page,
+      });
+      const res = await api("/api/search?" + qs);
+      if (gen !== state.gen) return;
+      for (const [src, e] of Object.entries(res.errors)) toast(`${src}: ${e}`, true);
+      const have = new Set(state.items.map((i) => i.source + i.id));
+      state.items.push(...res.items.filter((i) => !have.has(i.source + i.id)));
+      state.exhausted = res.exhausted;
+      render();
+    }
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    if (gen === state.gen) { state.fetching = false; render(); }
+  }
+}
+
+function cardFor(item) {
+  const c = document.createElement("div");
+  c.className = "card";
+  const mp = ((item.width * item.height) / 1e6).toFixed(1);
+  c.innerHTML = `
+    <div class="blur"></div>
+    <img alt="">
+    <div class="stamp yes">YES</div><div class="stamp no">NOPE</div>
+    <div class="loading">loading full image…</div>
+    <div class="meta">
+      <span class="badge src"></span>
+      <span class="badge">${item.width}×${item.height} · ${mp} MP</span>
+      <span class="title"></span>
+      <a target="_blank" rel="noopener">source ↗</a>
+    </div>`;
+  c.querySelector(".src").textContent = item.source;
+  c.querySelector(".title").textContent = [item.author && "by " + item.author, item.title].filter(Boolean).join(" — ");
+  c.querySelector("a").href = item.page;
+  c.querySelector(".blur").style.backgroundImage = `url("${item.thumb}")`;
+  const img = c.querySelector("img");
+  img.src = item.thumb;
+  // Swap the small thumb for the big preview once it has loaded.
+  const big = new Image();
+  big.onload = () => { img.src = item.preview; c.querySelector(".loading").remove(); };
+  big.onerror = () => { c.querySelector(".loading").textContent = "preview failed"; };
+  big.src = item.preview;
+  c._item = item;
+  return c;
+}
+
+const cardCache = new Map();
+function getCard(item) {
+  const k = item.source + ":" + item.id;
+  if (!cardCache.has(k)) cardCache.set(k, cardFor(item));
+  return cardCache.get(k);
+}
+
+function render() {
+  const stack = $("#stack");
+  const [top, next, ...rest] = state.items;
+  // Keep DOM nodes alive for the next few so their big previews preload.
+  for (const it of rest.slice(0, 2)) getCard(it);
+  const want = [next, top].filter(Boolean).map(getCard);
+  for (const el of [...stack.children]) if (!want.includes(el)) el.remove();
+  want.forEach((el, i) => {
+    el.classList.toggle("behind", i === 0 && want.length === 2);
+    el.style.transform = ""; el.style.opacity = "";
+    el.querySelectorAll(".stamp").forEach((s) => (s.style.opacity = 0));
+    stack.append(el);
+  });
+  if (top) attachDrag(getCard(top));
+  $("#empty").hidden = !!top;
+  $("#empty").querySelector("h2").textContent = state.fetching ? "Loading…" : "Nothing left";
+  if (state.items.length < 6) setTimeout(fill);
+}
+
+function attachDrag(card) {
+  if (card._drag) return;
+  card._drag = true;
+  let x0 = 0, y0 = 0, dx = 0, dy = 0, down = false;
+  card.addEventListener("pointerdown", (e) => {
+    if (e.target.closest("a") || card !== topCard()) return;
+    down = true; x0 = e.clientX; y0 = e.clientY; dx = dy = 0;
+    card.setPointerCapture(e.pointerId); card.classList.add("dragging"); card.classList.remove("snap");
+  });
+  card.addEventListener("pointermove", (e) => {
+    if (!down) return;
+    dx = e.clientX - x0; dy = e.clientY - y0;
+    card.style.transform = `translate(${dx}px, ${dy}px) rotate(${dx / 25}deg)`;
+    const t = Math.min(Math.abs(dx) / 120, 1);
+    card.querySelector(".stamp.yes").style.opacity = dx > 0 ? t : 0;
+    card.querySelector(".stamp.no").style.opacity = dx < 0 ? t : 0;
+  });
+  const up = () => {
+    if (!down) return;
+    down = false; card.classList.remove("dragging");
+    if (Math.abs(dx) > 120) decide(dx > 0 ? "yes" : "no");
+    else {
+      card.classList.add("snap"); card.style.transform = "";
+      card.querySelectorAll(".stamp").forEach((s) => (s.style.opacity = 0));
+    }
+  };
+  card.addEventListener("pointerup", up);
+  card.addEventListener("pointercancel", up);
+}
+
+const topCard = () => (state.items[0] ? getCard(state.items[0]) : null);
+
+function decide(verdict) {
+  const item = state.items[0];
+  if (!item) return;
+  const card = getCard(item);
+  card.classList.remove("dragging", "snap"); card.classList.add("fly");
+  card.querySelector(`.stamp.${verdict}`).style.opacity = 1;
+  const dir = verdict === "yes" ? 1 : -1;
+  card.style.transform = `translate(${dir * 130}vw, 40px) rotate(${dir * 30}deg)`;
+  card.style.opacity = 0;
+  state.items.shift();
+  state.history.push(item);
+  state.stats[verdict]++; renderStats();
+  setTimeout(() => {
+    card.classList.remove("fly"); card.remove();
+    cardCache.delete(item.source + ":" + item.id);
+  }, 350);
+  render();
+
+  if (verdict === "yes") toast("Downloading…");
+  api("/api/swipe", { item, verdict })
+    .then((r) => verdict === "yes" && toast("Saved " + r.file.split("/").pop()))
+    .catch((e) => { toast(e.message, true); state.stats[verdict]--; renderStats(); });
+}
+
+async function undo() {
+  const item = state.history.pop();
+  if (!item) return toast("Nothing to undo");
+  try {
+    await api("/api/undo", item);
+    state.items.unshift(item);
+    const cfg = await api("/api/config"); state.stats = cfg.stats; renderStats();
+    render();
+    toast("Undone");
+  } catch (e) { toast(e.message, true); }
+}
+
+$("#search").addEventListener("submit", (e) => { e.preventDefault(); $("#q").blur(); newSearch(); });
+for (const id of ["#sort", "#ratio", "#minres"]) $(id).addEventListener("change", newSearch);
+document.querySelectorAll("#cats .chip").forEach((c) => (c.onclick = () => { c.classList.toggle("on"); newSearch(); }));
+$("#yesbtn").onclick = () => decide("yes");
+$("#nobtn").onclick = () => decide("no");
+$("#undo").onclick = undo;
+$("#openbtn").onclick = () => state.items[0] && window.open(state.items[0].page, "_blank");
+$("#folderbtn").onclick = async () => {
+  const cur = $("#folderbtn").textContent.slice(3);
+  const folder = prompt("Download folder:", cur);
+  if (!folder || folder === cur) return;
+  const cfg = await api("/api/config", { folder });
+  $("#folderbtn").textContent = "📁 " + cfg.folder;
+};
+
+document.addEventListener("keydown", (e) => {
+  if (e.target.matches("input, select")) { if (e.key === "Escape") e.target.blur(); return; }
+  const k = e.key.toLowerCase();
+  if (k === "arrowright" || k === "l" || k === "d") decide("yes");
+  else if (k === "arrowleft" || k === "h" || k === "a") decide("no");
+  else if (k === "z" || k === "backspace" || k === "u") undo();
+  else if (k === "o") $("#openbtn").click();
+  else if (k === "/") { e.preventDefault(); $("#q").focus(); }
+  else return;
+  e.preventDefault();
+});
+
+init().catch((e) => toast(e.message, true));
+</script>
+</body>
+</html>

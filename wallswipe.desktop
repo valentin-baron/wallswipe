@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=wallswipe
+Comment=Swipe through wallpapers from several sites, keep the ones you like
+Exec=wallswipe
+Icon=preferences-desktop-wallpaper
+Terminal=false
+Categories=Graphics;Utility;
+Keywords=wallpaper;background;wallhaven;unsplash;pexels;
+StartupWMClass=wallswipe
