@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import queue
 import random
 import shutil
 import subprocess
@@ -21,6 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -146,6 +148,17 @@ class Wallhaven:
             "page": d["url"], "author": None, "title": d["category"],
             "colors": d.get("colors", []),
         } for d in data["data"]]
+
+
+    def details(self, wid):
+        """Tags and other metadata the search listing leaves out (one API call per wallpaper)."""
+        url = f"https://wallhaven.cc/api/v1/w/{wid}"
+        if self.key:
+            url += "?apikey=" + self.key
+        d = http_json(url)["data"]
+        return {"tags": [t["name"] for t in d["tags"]], "category": d["category"],
+                "width": d["dimension_x"], "height": d["dimension_y"], "page": d["url"],
+                "colors": d["colors"], "views": d["views"], "favorites": d["favorites"]}
 
 
 class Unsplash:
@@ -327,6 +340,87 @@ def trim_cache():
         p.with_suffix(".type").unlink(missing_ok=True)
 
 
+# --- swipe metadata and taste ----------------------------------------------------------
+
+meta_queue = queue.Queue()
+META_INTERVAL = 1.5  # seconds between detail calls; Wallhaven allows 45 per minute
+
+
+def has_details(key):
+    return "tags" in seen.get(key, {}).get("meta", {}) or seen.get(key, {}).get("meta", {}).get("gone")
+
+
+def meta_worker():
+    """Fill in tags for swiped wallpapers in the background, one API call at a time."""
+    while True:
+        key = meta_queue.get()
+        source, wid = key.split(":", 1)
+        src = SOURCES.get(source)
+        with lock:
+            skip = key not in seen or has_details(key)
+        if skip or not hasattr(src, "details"):
+            continue
+        try:
+            meta = src.details(wid)
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                time.sleep(60)
+                meta_queue.put(key)
+                continue
+            meta = {"gone": e.code}  # deleted upload; don't ask again
+        except (urllib.error.URLError, OSError, ValueError, KeyError):
+            time.sleep(30)
+            meta_queue.put(key)
+            continue
+        with lock:
+            if key in seen:
+                seen[key].setdefault("meta", {}).update(meta)
+                save_json(SEEN_FILE, seen)
+        time.sleep(META_INTERVAL)
+
+
+def aspect_bucket(w, h):
+    r = w / h
+    for name, lo, hi in (("portrait", 0, 0.95), ("4:3-ish", 0.95, 1.5), ("16:10", 1.5, 1.7),
+                         ("16:9", 1.7, 1.85), ("2:1", 1.85, 2.15), ("21:9", 2.15, 2.6),
+                         ("ultrawide", 2.6, 99)):
+        if lo <= r < hi:
+            return name
+    return "?"
+
+
+def taste():
+    """Which tags/categories/shapes come up more in right-swipes than in left-swipes.
+
+    A tag's like rate is smoothed toward the overall rate (two pseudo-swipes), so a tag
+    seen once doesn't top the list with 100%.
+    """
+    with lock:
+        entries = [e for e in seen.values() if "tags" in e.get("meta", {})]
+        pending = sum(1 for k in seen if not has_details(k) and k.startswith("wallhaven:"))
+    yes = sum(e["verdict"] == "yes" for e in entries)
+    base = (yes + 1) / (len(entries) + 2)
+
+    def table(keyfn, min_seen):
+        counts = defaultdict(lambda: [0, 0])
+        for e in entries:
+            for k in keyfn(e):
+                counts[k][e["verdict"] != "yes"] += 1
+        rows = [{"name": k, "yes": y, "no": n, "rate": (y + 2 * base) / (y + n + 2)}
+                for k, (y, n) in counts.items() if y + n >= min_seen]
+        return sorted(rows, key=lambda r: (-r["rate"], -r["yes"]))
+
+    tags = table(lambda e: set(e["meta"]["tags"]), 2)
+    return {
+        "swipes": len(entries), "yes": yes, "base": base, "pending": pending,
+        "liked": [r for r in tags if r["rate"] > base][:20],
+        "disliked": [r for r in reversed(tags) if r["rate"] < base][:20],
+        "categories": table(lambda e: [e["meta"].get("category", "?")], 1),
+        "shapes": table(lambda e: [aspect_bucket(e["meta"]["width"], e["meta"]["height"])]
+                        if e["meta"].get("width") else [], 1),
+    }
+
+
 def trim_bars(path):
     """Cut black letterbox/pillarbox bars that some uploads bake into the file.
 
@@ -411,6 +505,8 @@ class Handler(BaseHTTPRequestHandler):
                 "sources": [{"name": s.name, "label": s.label, "available": s.available()}
                             for s in SOURCES.values()],
             })
+        if url.path == "/api/taste":
+            return self.send(200, taste())
         if url.path == "/api/search":
             q = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
             f = {
@@ -430,7 +526,11 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/swipe":
             item, verdict = data["item"], data["verdict"]
             key = f"{item['source']}:{item['id']}"
-            entry = {"verdict": verdict}
+            entry = {"verdict": verdict, "at": int(time.time()), "meta": {
+                "width": item["width"], "height": item["height"], "page": item.get("page"),
+                "title": item.get("title"), "author": item.get("author"),
+                "colors": item.get("colors", []),
+            }}
             if verdict == "yes":
                 try:
                     entry["file"] = str(download(item))
@@ -439,6 +539,7 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 seen[key] = entry
                 save_json(SEEN_FILE, seen)
+            meta_queue.put(key)
             return self.send(200, entry)
         if url.path == "/api/undo":
             key = f"{data['source']}:{data['id']}"
@@ -496,6 +597,11 @@ def main():
     url = f"http://127.0.0.1:{server.server_address[1]}/"
     print(f"wallswipe on {url}  (saving to {config['folder']})", flush=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=meta_worker, daemon=True).start()
+    with lock:
+        for key in seen:  # backfill swipes made before metadata was kept
+            if not has_details(key):
+                meta_queue.put(key)
 
     proc = None if args.no_window else open_window(url)
     try:

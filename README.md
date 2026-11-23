@@ -53,6 +53,9 @@ minimum resolution, sources, Wallhaven categories. They persist between runs.
 - Image cache: `~/.cache/wallswipe/` (capped at 1 GB, oldest first). Cards only appear
   once their full-resolution image is downloaded and decoded; the next 10 are kept ready
   in the background, and a right-swipe copies the cached file instead of downloading again.
+- Taste (`T` or the ♥ Taste button): which tags, categories and shapes you swipe right on
+  more than left, from Wallhaven's tags for every swipe (fetched in the background,
+  ~40/min; older swipes are backfilled on start). Click a tag to search it.
 - Search history: dropdown under the search box (↑/↓, Enter, ✕ to forget one); picking an
   entry restores its filters too. Last 100 searches, in `history.json`.
 - State: `~/.local/state/wallswipe/` (`config.json`, `seen.json`, `history.json`). Delete `seen.json`
