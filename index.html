@@ -51,7 +51,9 @@
     font-size: 34px; font-weight: 800; letter-spacing: 2px; opacity: 0; }
   .stamp.yes { left: 28px; color: var(--yes); transform: rotate(-14deg); }
   .stamp.no { right: 28px; color: var(--no); transform: rotate(14deg); }
-  .loading { position: absolute; top: 14px; right: 16px; font-size: 12px; color: var(--dim); }
+  .loading { position: absolute; top: 14px; right: 16px; font-size: 12px; color: var(--dim);
+    padding: 4px 10px; border-radius: 8px; background: #0009; }
+  .loading.failed { color: #fff; background: var(--no); font-size: 14px; font-weight: 600; cursor: pointer; }
 
   #empty { position: absolute; inset: 0; display: grid; place-items: center; text-align: center; color: var(--dim); }
   #empty[hidden] { display: none; }
@@ -242,10 +244,26 @@ function cardFor(item) {
   const img = c.querySelector("img");
   img.src = item.thumb;
   // Swap the small thumb for the big preview once it has loaded.
-  const big = new Image();
-  big.onload = () => { img.src = item.preview; c.querySelector(".loading").remove(); };
-  big.onerror = () => { c.querySelector(".loading").textContent = "preview failed"; };
-  big.src = item.preview;
+  // Wallhaven's CDN occasionally refuses the full image (rate limit), so retry with backoff
+  // instead of leaving the blurry thumb up.
+  const label = c.querySelector(".loading");
+  let tries = 0;
+  const load = () => {
+    const big = new Image();
+    big.onload = () => { img.src = big.src; label.remove(); };
+    big.onerror = () => {
+      if (++tries < 4) {
+        label.textContent = `full image failed, retrying (${tries}/3)…`;
+        setTimeout(load, 1500 * tries);
+      } else {
+        label.textContent = "LOW-RES THUMBNAIL ONLY — click to retry (download is still full-res)";
+        label.classList.add("failed");
+        label.onclick = (e) => { e.stopPropagation(); tries = 0; label.classList.remove("failed"); label.textContent = "loading full image…"; load(); };
+      }
+    };
+    big.src = item.preview + (tries ? (item.preview.includes("?") ? "&" : "?") + "r=" + tries : "");
+  };
+  load();
   c._item = item;
   return c;
 }
@@ -281,7 +299,7 @@ function attachDrag(card) {
   card._drag = true;
   let x0 = 0, y0 = 0, dx = 0, dy = 0, down = false;
   card.addEventListener("pointerdown", (e) => {
-    if (e.target.closest("a") || card !== topCard()) return;
+    if (e.target.closest("a, .loading") || card !== topCard()) return;
     down = true; x0 = e.clientX; y0 = e.clientY; dx = dy = 0;
     card.setPointerCapture(e.pointerId); card.classList.add("dragging"); card.classList.remove("snap");
   });
