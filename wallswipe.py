@@ -327,6 +327,36 @@ def trim_cache():
         p.with_suffix(".type").unlink(missing_ok=True)
 
 
+def trim_bars(path):
+    """Cut black letterbox/pillarbox bars that some uploads bake into the file.
+
+    Wallpaper setters crop-to-fill, so baked-in bars end up on screen. Needs ImageMagick;
+    without it the file is kept as is. Only symmetric, near-pure-black bars on two opposite
+    sides count, so dark artwork isn't eaten into.
+    """
+    if not shutil.which("magick"):
+        return
+    def info(*args):
+        return subprocess.run(["magick", str(path), *args, "info:"], capture_output=True,
+                              text=True, timeout=60, check=True).stdout.split()
+    try:
+        w, h, c1, c2 = info("-format", "%w %h %[fx:p{0,0}.intensity] %[fx:p{w-1,h-1}.intensity]")
+        tw, th, x, y = (int(v) for v in info("-fuzz", "2%", "-trim", "-format", "%w %h %X %Y"))
+        w, h = int(w), int(h)
+        dark = float(c1) < 0.03 and float(c2) < 0.03
+        letterbox = tw == w and th < h * 0.97 and abs((h - th - y) - y) <= 4
+        pillarbox = th == h and tw < w * 0.97 and abs((w - tw - x) - x) <= 4
+        if not dark or not (letterbox or pillarbox):
+            return
+        tmp = path.with_name(path.stem + ".trim" + path.suffix)
+        subprocess.run(["magick", str(path), "-crop", f"{tw}x{th}+{x}+{y}", "+repage",
+                        "-quality", "95", str(tmp)], check=True, timeout=120)
+        tmp.replace(path)
+        print(f"trimmed bars: {path.name} {w}x{h} -> {tw}x{th}", flush=True)
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        print(f"trim failed for {path.name}: {e}", flush=True)
+
+
 def download(item):
     """Save the full-resolution file; reuses the cached copy the card was shown from."""
     folder = Path(os.path.expanduser(config["folder"]))
@@ -336,6 +366,7 @@ def download(item):
     tmp = dest.with_suffix(dest.suffix + ".part")
     shutil.copyfile(cached, tmp)
     tmp.replace(dest)
+    trim_bars(dest)
     src = SOURCES.get(item["source"])
     if hasattr(src, "on_download"):
         threading.Thread(target=src.on_download, args=(item,), daemon=True).start()
@@ -479,4 +510,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--trim"]:  # one-off cleanup: wallswipe.py --trim FILE...
+        for f in sys.argv[2:]:
+            trim_bars(Path(f))
+        sys.exit(0)
     main()
