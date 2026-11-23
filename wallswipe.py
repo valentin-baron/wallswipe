@@ -29,6 +29,8 @@ HERE = Path(__file__).resolve().parent
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "wallswipe"
 CONFIG_FILE = STATE_DIR / "config.json"
 SEEN_FILE = STATE_DIR / "seen.json"
+HISTORY_FILE = STATE_DIR / "history.json"
+HISTORY_LIMIT = 100
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "wallswipe"
 CACHE_LIMIT = 1 << 30  # bytes; oldest files go first once the image cache grows past this
 UA = "wallswipe/1.0"
@@ -60,6 +62,7 @@ def save_json(path, data):
 
 config = {"folder": str(Path.home() / "Pictures/Wallpapers")} | load_json(CONFIG_FILE, {})
 seen = load_json(SEEN_FILE, {})  # "source:id" -> {"verdict": "yes"|"no", "file": path?}
+history = load_json(HISTORY_FILE, [])  # newest first: {q, sort, ratio, minres, sources, cats}
 
 
 def key_from(env, secret_key):
@@ -373,7 +376,7 @@ class Handler(BaseHTTPRequestHandler):
                 stats = {"yes": sum(v["verdict"] == "yes" for v in seen.values()),
                          "no": sum(v["verdict"] == "no" for v in seen.values())}
             return self.send(200, {
-                "folder": config["folder"], "stats": stats,
+                "folder": config["folder"], "stats": stats, "history": history,
                 "sources": [{"name": s.name, "label": s.label, "available": s.available()}
                             for s in SOURCES.values()],
             })
@@ -419,6 +422,17 @@ class Handler(BaseHTTPRequestHandler):
                 config["folder"] = data["folder"]
                 save_json(CONFIG_FILE, config)
             return self.send(200, config)
+        if url.path == "/api/history":
+            # {"entry": {...}} records a search (moving a repeated query to the top);
+            # {"delete": "query"} forgets one.
+            with lock:
+                q = data["entry"]["q"] if "entry" in data else data.get("delete")
+                history[:] = [h for h in history if h["q"] != q]
+                if "entry" in data:
+                    history.insert(0, data["entry"])
+                    del history[HISTORY_LIMIT:]
+                save_json(HISTORY_FILE, history)
+            return self.send(200, history)
         if url.path == "/api/reset-seen":
             with lock:
                 n = sum(1 for v in seen.values() if v["verdict"] == "no")

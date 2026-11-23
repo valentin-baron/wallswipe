@@ -17,8 +17,17 @@
   header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 14px;
     background: var(--panel); border-bottom: 1px solid var(--line); }
   header form { display: contents; }
-  #q { flex: 1 1 220px; min-width: 160px; padding: 8px 12px; border-radius: 10px;
-    border: 1px solid var(--line); background: var(--bg); }
+  .qwrap { position: relative; flex: 1 1 220px; min-width: 160px; }
+  #q { width: 100%; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); }
+  #hist { position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 20; max-height: 60vh;
+    overflow-y: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    box-shadow: 0 10px 30px #000a; padding: 4px; }
+  #hist .h { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 7px; cursor: pointer; }
+  #hist .h.sel, #hist .h:hover { background: var(--line); }
+  #hist .hq { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #hist .hf { color: var(--dim); font-size: 12px; white-space: nowrap; }
+  #hist .hx { border: 0; background: none; color: var(--dim); cursor: pointer; padding: 0 4px; font-size: 15px; }
+  #hist .hx:hover { color: var(--no); }
   select { padding: 7px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); }
   .chips { display: flex; gap: 4px; }
   .chip { padding: 6px 10px; border-radius: 999px; border: 1px solid var(--line);
@@ -78,7 +87,10 @@
 <body>
 <header>
   <form id="search">
-    <input id="q" placeholder="Search wallpapers…  ( / )" autocomplete="off">
+    <div class="qwrap">
+      <input id="q" placeholder="Search wallpapers…  ( / )" autocomplete="off">
+      <div id="hist" hidden></div>
+    </div>
     <select id="sort" title="Sort">
       <option value="relevance">Relevance</option>
       <option value="top">Top</option>
@@ -168,6 +180,7 @@ function renderStats() {
 async function init() {
   const cfg = await api("/api/config");
   state.stats = cfg.stats; renderStats();
+  state.searchHistory = cfg.history || [];
   $("#folderbtn").textContent = "📁 " + cfg.folder;
   const p = loadPrefs();
   const wanted = p.sources || cfg.sources.filter((s) => s.available).map((s) => s.name);
@@ -189,6 +202,8 @@ async function init() {
 
 function newSearch() {
   savePrefs();
+  const p = prefs();
+  if (p.q.trim()) api("/api/history", { entry: { ...p, q: p.q.trim() } }).then((h) => (state.searchHistory = h)).catch(() => {});
   state.items = []; state.queue = []; state.loading = 0; state.failed = 0;
   state.page = 0; state.exhausted = false; state.history = [];
   state.seed = Math.random().toString(36).slice(2, 8);
@@ -368,7 +383,61 @@ async function undo() {
   } catch (e) { toast(e.message, true); }
 }
 
-$("#search").addEventListener("submit", (e) => { e.preventDefault(); $("#q").blur(); newSearch(); });
+$("#search").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const sel = $("#hist .h.sel");
+  if (sel && !$("#hist").hidden) return sel.click();
+  $("#q").blur(); newSearch();
+});
+
+// Search history: dropdown under the box, filtered by what's typed. Picking an entry
+// restores its filters too.
+function applyHistory(h) {
+  $("#q").value = h.q;
+  if (h.sort) $("#sort").value = h.sort;
+  if (h.ratio) $("#ratio").value = h.ratio;
+  if (h.minres !== undefined) $("#minres").value = h.minres;
+  if (h.sources) document.querySelectorAll("#sources .chip").forEach((c) => !c.disabled && c.classList.toggle("on", h.sources.includes(c.dataset.src)));
+  if (h.cats) [...document.querySelectorAll("#cats .chip")].forEach((c, i) => c.classList.toggle("on", h.cats[i] === "1"));
+  $("#q").blur();
+  newSearch();
+}
+function renderHistory() {
+  const box = $("#hist"), typed = $("#q").value.trim().toLowerCase();
+  const list = (state.searchHistory || []).filter((h) => h.q.toLowerCase().includes(typed) && h.q.toLowerCase() !== typed).slice(0, 15);
+  box.replaceChildren();
+  for (const h of list) {
+    const row = document.createElement("div");
+    row.className = "h";
+    const ratio = h.ratio && h.ratio !== "any" ? h.ratio.replace("x", ":") : "";
+    row.innerHTML = `<span class="hq"></span><span class="hf"></span><button type="button" class="hx" title="Remove">✕</button>`;
+    row.querySelector(".hq").textContent = h.q;
+    row.querySelector(".hf").textContent = [h.sort, ratio, h.minres && "≥" + h.minres].filter(Boolean).join(" · ");
+    row.onmousedown = (e) => e.preventDefault(); // keep focus in the box
+    row.onclick = () => applyHistory(h);
+    row.querySelector(".hx").onclick = async (e) => {
+      e.stopPropagation();
+      state.searchHistory = await api("/api/history", { delete: h.q });
+      renderHistory();
+    };
+    box.append(row);
+  }
+  box.hidden = !list.length || document.activeElement !== $("#q");
+}
+$("#q").addEventListener("focus", renderHistory);
+$("#q").addEventListener("input", renderHistory);
+$("#q").addEventListener("blur", () => ($("#hist").hidden = true));
+$("#q").addEventListener("keydown", (e) => {
+  if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+  e.preventDefault();
+  const rows = [...document.querySelectorAll("#hist .h")];
+  if (!rows.length) return;
+  const i = rows.findIndex((r) => r.classList.contains("sel"));
+  rows.forEach((r) => r.classList.remove("sel"));
+  const n = e.key === "ArrowDown" ? (i + 1) % rows.length : (i <= 0 ? rows.length : i) - 1;
+  rows[n].classList.add("sel");
+  rows[n].scrollIntoView({ block: "nearest" });
+});
 for (const id of ["#sort", "#ratio", "#minres"]) $(id).addEventListener("change", newSearch);
 document.querySelectorAll("#cats .chip").forEach((c) => (c.onclick = () => { c.classList.toggle("on"); newSearch(); }));
 $("#yesbtn").onclick = () => decide("yes");
