@@ -56,6 +56,10 @@ minimum resolution, sources, Wallhaven categories. They persist between runs.
 - Taste (`T` or the ♥ Taste button): which tags, categories and shapes you swipe right on
   more than left, from Wallhaven's tags for every swipe (fetched in the background,
   ~40/min; older swipes are backfilled on start). Click a tag to search it.
+- For you (sort menu): searches built from your taste instead of a query. Each page searches a
+  few liked tags (random order, so it never runs dry), excludes your most-skipped tags, and
+  puts your favourite shapes first; the green badge says which tag found it. Anything typed
+  in the search box is added to every search. Needs a few likes with tags first.
 - Search history: dropdown under the search box (↑/↓, Enter, ✕ to forget one); picking an
   entry restores its filters too. Last 100 searches, in `history.json`.
 - State: `~/.local/state/wallswipe/` (`config.json`, `seen.json`, `history.json`). Delete `seen.json`

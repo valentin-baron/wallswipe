@@ -275,6 +275,73 @@ def fused_search(f, page):
     return {"items": fused, "errors": errors, "exhausted": exhausted}
 
 
+FOR_YOU_TAGS = 3  # tag searches per "For you" page
+FOR_YOU_EXCLUDE = 5  # strongest skip tags excluded from every "For you" search
+# Tags about format or quality rather than content; shape preference is handled separately,
+# so these never drive a "For you" search (they can still be excluded).
+META_TAGS = {"watermarked", "wide screen", "ultrawide", "4k", "8k", "5k", "high resolution",
+             "portrait display", "screen shot", "text", "signature", "digital art", "artwork",
+             "illustration", "digital", "ai art", "upscaled", "cgi", "render", "3d"}
+
+
+def for_you_search(f):
+    """Wallhaven searches built from the taste breakdown instead of a typed query.
+
+    Each page searches a few liked tags (weighted toward the strongest, random sorting with
+    a fresh seed, so results never run dry), excludes the most-skipped tags, and puts the
+    shapes you like most first. Wallhaven's like:<id> search would fit better but sits
+    behind a Cloudflare challenge for API clients.
+    """
+    t = taste()
+    liked = [r for r in t["liked"] if r["yes"] >= 2 and r["name"].lower() not in META_TAGS]
+    if len(liked) < 3:
+        return {"items": [], "exhausted": True,
+                "errors": {"for you": "not enough likes with tags yet; swipe some searches first"}}
+
+    def term(tag):
+        return f'"{tag}"' if " " in tag else tag
+
+    skips = [r["name"] for r in t["disliked"] if r["no"] >= 4][:FOR_YOU_EXCLUDE]
+    exclude = " ".join("-" + term(tag) for tag in skips)
+    weights = [(r["rate"] - t["base"]) * r["yes"] for r in liked]
+    picks = []
+    while len(picks) < min(FOR_YOU_TAGS, len(liked)):
+        r = random.choices(liked, weights)[0]
+        if r not in picks:
+            picks.append(r)
+
+    wh = SOURCES["wallhaven"]
+    errors = {}
+
+    def run(r):
+        g = f | {"sort": "random", "seed": "%06x" % random.getrandbits(24),
+                 "q": " ".join(x for x in (f["q"], term(r["name"]), exclude) if x)}
+        try:
+            return [i | {"why": r["name"]} for i in wh.search(g, 1)]
+        except Exception as e:
+            errors["wallhaven"] = str(e)
+            return []
+
+    with ThreadPoolExecutor(len(picks)) as pool:
+        found = [i for lst in pool.map(run, picks) for i in lst]
+
+    shape = {r["name"]: r["rate"] for r in t["shapes"]}
+    minw, minh = (map(int, f["minres"].split("x")) if f["minres"] else (0, 0))
+    out, ids = [], set()
+    with lock:
+        for i in found:
+            key = f"wallhaven:{i['id']}"
+            if key in seen or key in ids or i["width"] < minw or i["height"] < minh \
+                    or not ratio_ok(i["width"], i["height"], f["ratio"]):
+                continue
+            ids.add(key)
+            i["score"] = shape.get(aspect_bucket(i["width"], i["height"]), t["base"]) \
+                * random.uniform(0.6, 1.4)
+            out.append(i)
+    out.sort(key=lambda i: -i["score"])
+    return {"items": out, "errors": errors, "exhausted": False}
+
+
 EXTS = {"image/png": ".png", "image/webp": ".webp", "image/avif": ".avif", "image/jpeg": ".jpg"}
 url_locks = {}  # one in-flight fetch per URL; a second request waits and hits the cache
 
@@ -343,7 +410,7 @@ def trim_cache():
 # --- swipe metadata and taste ----------------------------------------------------------
 
 meta_queue = queue.Queue()
-META_INTERVAL = 1.5  # seconds between detail calls; Wallhaven allows 45 per minute
+META_INTERVAL = 3  # seconds between detail calls; Wallhaven allows 45 API calls/min in total
 
 
 def has_details(key):
@@ -517,6 +584,8 @@ class Handler(BaseHTTPRequestHandler):
                 "color": q.get("color", ""), "color_name": q.get("color_name", ""),
                 "seed": q.get("seed", "abc123"),
             }
+            if f["sort"] == "foryou":
+                return self.send(200, for_you_search(f))
             return self.send(200, fused_search(f, int(q.get("page", 1))))
         self.send(404, {"error": "not found"})
 
